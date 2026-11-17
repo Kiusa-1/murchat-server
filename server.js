@@ -1,4 +1,4 @@
-// server.js — Мурчат v4 (Node 18+, без зависимостей)
+// server.js — Мурчат v5 (Node 18+, без зависимостей)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -6,7 +6,7 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
 const DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const INVITE = process.env.INVITE_CODE || '';        // если задан, регистрироваться могут только с кодом
+const INVITE = process.env.INVITE_CODE || '';
 const MAX_USERS = Number(process.env.MAX_USERS) || 100;
 const BLOBS = path.join(DIR, 'blobs');
 fs.mkdirSync(BLOBS, { recursive: true });
@@ -26,13 +26,12 @@ setInterval(() => {
 
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
 const waiters = {};
-const open = {};      // сколько открытых «долгих опросов» у пользователя (признак «в сети»)
+const open = {};
 const lastSeen = {};
 const hidden = {};
 let lastMsgId = 0;
 const nextId = () => (lastMsgId = Math.max(lastMsgId + 1, Date.now() * 1000));
 
-// Простая защита от перебора и спама: счётчики по IP за минуту
 const hits = {};
 setInterval(() => { for (const k in hits) delete hits[k]; }, 60000);
 const limited = (ip, key, max) => { const k = ip + '|' + key; hits[k] = (hits[k] || 0) + 1; return hits[k] > max; };
@@ -62,25 +61,27 @@ const authed = (req) => {
   if (!u || !t) return null;
   return crypto.timingSafeEqual(sha(t), Buffer.from(u.th, 'hex')) ? n : null;
 };
-const isOnline = (n) => !hidden[n] && ((open[n] || 0) > 0 || Date.now() - (lastSeen[n] || 0) < 6000);
+// «В сети»: есть открытый запрос или был на связи меньше 35 секунд назад
+const isOnline = (n) => !hidden[n] && ((open[n] || 0) > 0 || Date.now() - (lastSeen[n] || 0) < 35000);
+const okEc = (s) => typeof s === 'string' && /^(#[0-9a-fA-F]{6})?$/.test(s);
 
 const server = http.createServer(async (req, res) => {
-  req.socket.setNoDelay(true); // без задержек на отправку мелких пакетов
+  req.socket.setNoDelay(true);
   try {
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-    if (limited(ip, 'all', 900)) return reply(res, 429, {});
+    if (limited(ip, 'all', 1200)) return reply(res, 429, {});
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
 
     if (req.method === 'GET' && (p === '/' || p === '/health')) return reply(res, 200, { ok: true });
 
-    // Регистрация / вход. Ник занят навсегда, пока существует аккаунт.
+    // Регистрация / вход. Юзернейм занят навсегда, пока существует аккаунт, и меняться не может.
     if (req.method === 'POST' && p === '/register') {
       if (limited(ip, 'reg', 20)) return reply(res, 429, {});
       const n = req.headers['x-n'];
       const t = req.headers['x-t'];
       if (!/^[a-z0-9_]{3,20}$/.test(n || '') || !t) return reply(res, 400, {});
-      const { pub, av, dn } = JSON.parse(await body(req, 60000));
+      const { pub, av, dn, ec } = JSON.parse(await body(req, 60000));
       if (typeof pub !== 'string' || pub.length > 100) return reply(res, 400, {});
       const old = db.users[n];
       if (old) {
@@ -93,6 +94,7 @@ const server = http.createServer(async (req, res) => {
         pub, th: sha(t).toString('hex'),
         av: typeof av === 'string' && av.length < 40000 ? av : old ? old.av : null,
         dn: typeof dn === 'string' && dn.trim() ? dn.trim().slice(0, 24) : old ? old.dn : n,
+        ec: okEc(ec) && ec ? ec : old ? old.ec || '' : '',
         cf: old ? !!old.cf : false,
       };
       dirty = true;
@@ -103,8 +105,7 @@ const server = http.createServer(async (req, res) => {
       const n = decodeURIComponent(p.slice(6));
       const u = db.users[n];
       if (!u) return reply(res, 404, {});
-      const on = isOnline(n);
-      return reply(res, 200, { pub: u.pub, av: u.av, dn: u.dn || n, cf: !!u.cf, online: on, seen: hidden[n] ? 0 : lastSeen[n] || 0 });
+      return reply(res, 200, { pub: u.pub, av: u.av, dn: u.dn || n, ec: u.ec || '', cf: !!u.cf, online: isOnline(n), seen: hidden[n] ? 0 : lastSeen[n] || 0 });
     }
 
     if (req.method === 'GET' && p.startsWith('/blob/')) {
@@ -123,13 +124,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && p === '/profile') {
-      const { av, dn, cf } = JSON.parse(await body(req, 60000));
+      const { av, dn, cf, ec } = JSON.parse(await body(req, 60000));
       const u = db.users[me];
       if (typeof av === 'string' && av.length < 40000) u.av = av;
       if (typeof dn === 'string' && dn.trim()) u.dn = dn.trim().slice(0, 24);
       if (typeof cf === 'boolean') u.cf = cf;
+      if (okEc(ec)) u.ec = ec;
       dirty = true;
       return reply(res, 200, {});
+    }
+
+    // Пакетная проверка «в сети» для списка юзернеймов
+    if (req.method === 'GET' && p === '/presence') {
+      const out = {};
+      String(url.searchParams.get('ids') || '').split(',').slice(0, 40).forEach((n) => {
+        if (db.users[n]) out[n] = { on: isOnline(n), seen: hidden[n] ? 0 : lastSeen[n] || 0 };
+      });
+      return reply(res, 200, out);
     }
 
     if (req.method === 'POST' && p === '/blob') {
@@ -150,7 +161,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && p === '/send') {
-      if (limited(ip, 'send', 300)) return reply(res, 429, {});
+      if (limited(ip, 'send', 400)) return reply(res, 429, {});
       const { items } = JSON.parse(await body(req, 400000));
       if (!Array.isArray(items) || items.length > 60) return reply(res, 400, {});
       for (const it of items) {
@@ -164,7 +175,6 @@ const server = http.createServer(async (req, res) => {
       return reply(res, 200, {});
     }
 
-    // Долгий опрос: ответ сразу при новом сообщении или через 25 с. Заодно это признак «в сети».
     if (req.method === 'GET' && p === '/poll') {
       const after = Number(url.searchParams.get('after')) || 0;
       hidden[me] = req.headers['x-h'] === '1';
@@ -187,7 +197,6 @@ const server = http.createServer(async (req, res) => {
     try { reply(res, 400, {}); } catch (_) {}
   }
 });
-// Чтобы прокси Render не рвал соединения и не добавлял задержки на переподключение
 server.keepAliveTimeout = 70000;
 server.headersTimeout = 75000;
 
