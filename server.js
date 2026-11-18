@@ -1,4 +1,4 @@
-// server.js — Мурчат v5 (Node 18+, без зависимостей)
+// server.js — Мурчат v6 (Node 18+, без зависимостей)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -8,6 +8,8 @@ const PORT = process.env.PORT || 8080;
 const DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const INVITE = process.env.INVITE_CODE || '';
 const MAX_USERS = Number(process.env.MAX_USERS) || 100;
+const LATEST_VERSION = Number(process.env.LATEST_VERSION) || 6; // номер последней версии приложения
+const UPDATE_URL = process.env.UPDATE_URL || '';                // куда вести кнопку «Обновить»
 const BLOBS = path.join(DIR, 'blobs');
 fs.mkdirSync(BLOBS, { recursive: true });
 
@@ -61,7 +63,6 @@ const authed = (req) => {
   if (!u || !t) return null;
   return crypto.timingSafeEqual(sha(t), Buffer.from(u.th, 'hex')) ? n : null;
 };
-// «В сети»: есть открытый запрос или был на связи меньше 35 секунд назад
 const isOnline = (n) => !hidden[n] && ((open[n] || 0) > 0 || Date.now() - (lastSeen[n] || 0) < 35000);
 const okEc = (s) => typeof s === 'string' && /^(#[0-9a-fA-F]{6})?$/.test(s);
 
@@ -69,13 +70,13 @@ const server = http.createServer(async (req, res) => {
   req.socket.setNoDelay(true);
   try {
     const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-    if (limited(ip, 'all', 1200)) return reply(res, 429, {});
+    if (limited(ip, 'all', 1600)) return reply(res, 429, {});
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
 
     if (req.method === 'GET' && (p === '/' || p === '/health')) return reply(res, 200, { ok: true });
+    if (req.method === 'GET' && p === '/version') return reply(res, 200, { latest: LATEST_VERSION, url: UPDATE_URL });
 
-    // Регистрация / вход. Юзернейм занят навсегда, пока существует аккаунт, и меняться не может.
     if (req.method === 'POST' && p === '/register') {
       if (limited(ip, 'reg', 20)) return reply(res, 429, {});
       const n = req.headers['x-n'];
@@ -134,7 +135,6 @@ const server = http.createServer(async (req, res) => {
       return reply(res, 200, {});
     }
 
-    // Пакетная проверка «в сети» для списка юзернеймов
     if (req.method === 'GET' && p === '/presence') {
       const out = {};
       String(url.searchParams.get('ids') || '').split(',').slice(0, 40).forEach((n) => {
@@ -160,15 +160,18 @@ const server = http.createServer(async (req, res) => {
       return res.end(fs.existsSync(f) ? fs.readFileSync(f) : '');
     }
 
+    // Отправка. Элементы с e:1 («печатает…») недолговечны: не копятся и живут 20 секунд.
     if (req.method === 'POST' && p === '/send') {
-      if (limited(ip, 'send', 400)) return reply(res, 429, {});
+      if (limited(ip, 'send', 600)) return reply(res, 429, {});
       const { items } = JSON.parse(await body(req, 400000));
       if (!Array.isArray(items) || items.length > 60) return reply(res, 400, {});
       for (const it of items) {
         if (!it || !db.users[it.to] || typeof it.c !== 'string' || it.c.length > 20000) continue;
         const q = (db.msgs[it.to] = db.msgs[it.to] || []);
         if (q.length > 3000) q.shift();
-        q.push({ id: nextId(), from: me, c: it.c, ts: Date.now() });
+        const m = { id: nextId(), from: me, c: it.c, ts: Date.now() };
+        if (it.e) m.x = Date.now() + 20000;
+        q.push(m);
         (waiters[it.to] || []).splice(0).forEach((w) => w());
       }
       dirty = true;
@@ -179,7 +182,7 @@ const server = http.createServer(async (req, res) => {
       const after = Number(url.searchParams.get('after')) || 0;
       hidden[me] = req.headers['x-h'] === '1';
       lastSeen[me] = Date.now();
-      const get = () => (db.msgs[me] || []).filter((m) => m.id > after).slice(0, 200);
+      const get = () => (db.msgs[me] || []).filter((m) => m.id > after && (!m.x || m.x > Date.now())).slice(0, 200);
       const now = get();
       if (now.length) return reply(res, 200, now);
       let done = false;
@@ -202,12 +205,15 @@ server.headersTimeout = 75000;
 
 setInterval(() => {
   const now = Date.now();
+  for (const n in db.msgs) db.msgs[n] = db.msgs[n].filter((m) => (m.x ? m.x > now : now - m.ts < 14 * 864e5));
+  dirty = true;
+}, 30000);
+setInterval(() => {
+  const now = Date.now();
   for (const f of fs.readdirSync(BLOBS)) {
     const fp = path.join(BLOBS, f);
     if (now - fs.statSync(fp).mtimeMs > 14 * 864e5) fs.unlinkSync(fp);
   }
-  for (const n in db.msgs) db.msgs[n] = db.msgs[n].filter((m) => now - m.ts < 14 * 864e5);
-  dirty = true;
 }, 3600e3);
 
 server.listen(PORT, () => console.log('Сервер запущен на порту ' + PORT));
